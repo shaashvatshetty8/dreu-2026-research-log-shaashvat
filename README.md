@@ -89,7 +89,7 @@ The results so far suggest that visual-token Key caches may have a consistent ou
 
 ---
 
-## Week 6 (Still in Progress)
+## Week 6
 
 ### Goals
 Slow down and focus on understanding the model architecture, the datasets, and the meaning of the current results before choosing the next experiment direction.
@@ -106,10 +106,68 @@ I am now thinking about how this connects to the Mustafar paper and related work
 
 ---
 
+## Week 7
+
+### Goals
+Turn the Week 6 reading on the Mustafar paper into an actual implementation, and test whether the channel-concentration pattern found in Weeks 4-5 can be used to prune the visual-token Key cache without hurting model output.
+
+### Approach and Implementation
+I implemented Mustafar's pruning rule directly rather than approximating it: I ported the actual pruning function from Mustafar's public repository so my implementation matches theirs exactly, and wrote a test that checks the two produce identical tensors. This is closest to Mustafar's `Kt_Mag` setting: Key cache, token-wise (each token's cache vector is pruned on its own), magnitude-based (keep the largest values, zero the rest).
+
+I first ran this offline against the saved cache files from Weeks 4-5 to measure how much magnitude survives pruning at different sparsity levels. Then I moved to a live version that actually prunes the KV cache during real generation on 50 COCO images with ground-truth captions, comparing pruned captions against the dense (unpruned) baseline using several metrics: token overlap, ROUGE, BLEU, CIDEr, and KL divergence between the pruned and dense next-token probability distributions. I learned an important detail of Mustafar's design along the way: it keeps the prefill attention computation dense and only prunes the tensor that gets stored afterward, so the very first generated token is always identical between pruned and dense runs. I also added a second "structured" pruning mode (dropping whole channels instead of individual token entries) so I could directly test Mustafar's central claim that unstructured pruning beats structured pruning at the same sparsity level.
+
+### Results
+The offline results supported the Week 4-5 finding: even after zeroing a large fraction of the visual-token Key cache, most of the original magnitude was retained, consistent with a small number of channels dominating the cache. The live generation results were the more important payoff: pruning visual-token Keys by 30-70% left the generated captions and next-token distributions close to the dense baseline, and the structured-vs-unstructured comparison showed the same pattern Mustafar reports in their paper - unstructured (token-wise) pruning holds up noticeably better than structured (channel-wise) pruning at matched sparsity.
+
+---
+
+## Week 8
+
+### Goals
+Move past caption-similarity metrics, which only measure whether two pieces of text read alike, and evaluate visual-token pruning with metrics that have an objective right or wrong answer. Also scale the pruning evaluation up to a real sweep across sparsity levels and multiple benchmarks.
+
+### Approach and Implementation
+I built a full evaluation pipeline around three benchmarks that each stress a different kind of question: TextVQA (reading text embedded in natural images), DocVQA (dense document pages, which are almost entirely visual tokens), and MMMU (broader visual reasoning). Each has a fixed ground-truth answer, so scoring is right/wrong rather than a similarity judgment. For every example, I ran the dense baseline and every pruning condition back-to-back on the identical prompt, sweeping sparsity from 50% up to 90% and pruning only the cache entries belonging to visual tokens, leaving every text-token entry fully dense so that any change in accuracy can be attributed to the visual tokens specifically.
+
+To make sure the pruning was actually doing something meaningful and not just getting lucky, I added two control conditions: a "random" control that zeros out the same number of cache entries per token but picks them randomly instead of by magnitude, and a "uniform" control that prunes text-token Keys too instead of only visual ones. I also caught and fixed a bug where different runs were capping image resolution differently, which made some of the DocVQA comparisons unfair, and re-ran the affected experiments once everything used the same visual-token count.
+
+### Results
+Accuracy from magnitude-based visual-token pruning stayed close to the dense baseline all the way out to 90% sparsity on both TextVQA and DocVQA. The random control, by contrast, collapsed almost immediately, losing large amounts of accuracy even at 50% sparsity. This was the clearest evidence yet that the benefit comes specifically from keeping the largest-magnitude cache entries, not simply from having a sparser cache. The uniform control (pruning text tokens as well) tracked the visual-only result closely through about 70% sparsity but then fell sharply between 80% and 90%, suggesting visual tokens tolerate aggressive pruning better than text tokens do, though the biggest danger zone turned out to be very high sparsity in general rather than text tokens specifically.
+
+---
+
+## Week 9
+
+### Goals
+Find the best combination of Key-cache and Value-cache sparsity, and turn the pruning from a simulated "zero out and measure" experiment into a real, physically smaller cache with a measured memory savings.
+
+### Approach and Implementation
+I ran a grid search over different Key-sparsity and Value-sparsity combinations to find the setting that saves the most memory while staying within a small accuracy budget. I also built the actual compressed storage format that Mustafar's paper describes, rather than just zeroing entries inside a full-size tensor: pruned cache tensors are packed into small tiles, each with a compact bitmap marking which entries survived plus an offset table, so the cache is genuinely smaller in memory rather than just sparse-looking. I wrote tests confirming this compressed format produces bit-for-bit identical outputs to the earlier "zero out the dense tensor" approach, then measured the real GPU memory used by the compressed cache during generation on both TextVQA and DocVQA, and compared it against what an analytical model predicted the savings should be.
+
+### Results
+The grid search identified a Key/Value sparsity combination that kept the accuracy drop on both benchmarks within a small margin while cutting cache memory substantially. The compressed cache format worked correctly, generating identical text to the uncompressed version, and the measured GPU memory savings came out very close to what the analytical model had predicted, confirming that the compression scheme behaves the way the math says it should and that the savings are real rather than theoretical.
+
+---
+
+## Week 10
+
+### Goals
+Test whether the compressed, pruned cache also makes generation faster, not just smaller, and begin identifying a stronger version of the pruning method for the next phase of the project.
+
+### Approach and Implementation
+I integrated Mustafar's own GPU kernel, which reads the compressed cache format directly without ever decompressing it back to a dense tensor, and verified it against the dense baseline: correctness tests on GPU passed, and running the full 500-example evaluation on both TextVQA and DocVQA produced zero mismatched predictions between the pruned/compressed path and the dense path. I then benchmarked its speed and found it is currently slower than a standard dense attention implementation at the batch size I tested, which matches what the Mustafar paper itself reports: their own kernel is also slower than dense at small batch sizes and only wins once many sequences are processed together.
+
+With the implementation now correctness-verified and honestly benchmarked, I spent the rest of the week reading papers to figure out how to improve on straightforward magnitude-based pruning, which prunes every visual token to the same fixed sparsity regardless of how important that token actually is to the model's answer. I read LSH-E, which uses locality-sensitive hashing to quickly estimate, before attention is even computed, which cached tokens are least likely to matter for the current query, and evicts those rather than applying a fixed sparsity rate everywhere. I also read IVTP, which scores how important each visual token is using attention information from the model itself and prunes visual tokens in two stages, one based on the vision encoder and one guided by the actual text instruction, so that pruning aggressiveness adapts per token rather than being applied uniformly.
+
+### Results
+Both papers point toward the same idea I want to try next: instead of pruning every visual token's cache entries to the same sparsity level, the sparsity level itself could vary per token based on an importance score, similar to how LSH-E decides relevance before attention and how IVTP scores each visual token's importance to the instruction. The next step is to adapt the Mustafar-style pruning I already built and verified so that it applies a per-token, importance-weighted sparsity to visual patches instead of one fixed sparsity across the board, which should let genuinely unimportant patches be pruned harder while protecting the patches that matter most.
+
+---
+
 ## Current Status and Next Steps
 
 ### What I Have Done So Far
-So far, I have completed the initial proposal, built a Qwen2.5-VL KV-cache capture workflow, created profiling tools for visual-token and text-token cache analysis, and tested the pipeline on multiple datasets. I have run experiments on small COCO examples, TextVQA-50, COCO500, and ImageNet21k-500. Across the larger COCO and ImageNet21k experiments, the main finding is that visual-token Key caches show stronger outlier-channel behavior than visual-token Value caches. I am currently spending Week 6 interpreting these results and connecting them to the Mustafar paper.
+Over the first ten weeks, I completed the initial project proposal, built a Qwen2.5-VL KV-cache capture and profiling workflow, and used it to show that visual-token Key caches concentrate magnitude in a small number of channels while visual-token Value caches do not. I then implemented Mustafar-style magnitude-based pruning of the visual-token Key cache, verified it against the reference implementation, and evaluated it with objective right/wrong metrics across TextVQA, DocVQA, and MMMU, finding that visual-token pruning holds up to very high sparsity (90%) while a random-selection control collapses almost immediately, showing that magnitude-based selection is what matters. I found a strong Key/Value sparsity combination through a grid search, built and verified a real compressed cache format with measured (not just modeled) GPU memory savings, and integrated Mustafar's own GPU kernel, confirming it produces correct output but is currently slower than dense attention at low batch size, consistent with the original paper. This past week I read LSH-E and IVTP to look into importance-based, rather than uniform, token pruning.
 
 ### Next Goals
-The next step is to turn the current observations into a clearer written summary, compare them more directly with the Mustafar paper, and decide which follow-up experiment would best test whether the Key-cache concentration can be used for cache pruning. After that, the project can move toward comparing how pruning Key and Value channels affects model output quality.
+The next step is to extend the pruning method so that sparsity is chosen per visual token based on an importance score, rather than applying the same fixed sparsity to every visual patch, drawing on the ideas from LSH-E (relevance estimated before attention) and IVTP (instruction-aware importance scoring). Alongside that, I want to add a text-only pruning control to more directly test whether visual tokens are intrinsically more prunable than text tokens, and benchmark the kernel at larger batch sizes to see whether the speed gap with dense attention closes as the paper's own results suggest it should.
